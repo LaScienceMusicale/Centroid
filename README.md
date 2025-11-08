@@ -24,19 +24,6 @@ python main.py
 Par défaut, l’application capture le signal du micro par défaut et projette en
 3D un nuage de carrés connectés qui matérialise l’évolution timbrale du son.
 
-### Charger un fichier audio
-
-Vous pouvez visualiser un fichier (WAV, FLAC, OGG, etc.) en le passant en
-paramètre :
-
-```bash
-python main.py --file ~/musique/piste.wav
-```
-
-Une fois l’application ouverte, il est également possible de glisser-déposer un
-fichier audio directement sur la fenêtre VisPy pour remplacer la source en
-direct.
-
 ### Contrôles
 
 La caméra 3D est une caméra orbitale : utilisez la souris pour tourner autour

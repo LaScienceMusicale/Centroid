@@ -2,18 +2,14 @@
 from __future__ import annotations
 
 import math
-import threading
-import time
 from collections import deque
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Deque, Optional
+from typing import Deque
 
 from queue import Empty, SimpleQueue
 
 import numpy as np
 import sounddevice as sd
-import soundfile as sf
 from vispy import app, scene
 
 from .analysis import SpectralFeatureExtractor, SpectralFeatures
@@ -41,15 +37,16 @@ class AudioReactiveVisualizer:
         frame_size: int = 1024,
         hop_size: int = 1024,
         history_seconds: float = 10.0,
-        audio_path: Optional[str] = None,
     ) -> None:
-        self._default_sample_rate = sample_rate
+        self.sample_rate = sample_rate
         self.frame_size = frame_size
         self.hop_size = hop_size
-        self.history_seconds = history_seconds
+        self.extractor = SpectralFeatureExtractor(sample_rate)
+
+        max_points = int(math.ceil(history_seconds * sample_rate / hop_size))
+        self.history: Deque[TimbralPoint] = deque(maxlen=max_points)
 
         self._queue: SimpleQueue[SpectralFeatures] = SimpleQueue()
-        self.history: Deque[TimbralPoint] = deque()
 
         self._canvas = scene.SceneCanvas(keys="interactive", bgcolor="#050608", size=(1024, 768), show=True)
         self._view = self._canvas.central_widget.add_view()
@@ -67,105 +64,21 @@ class AudioReactiveVisualizer:
 
         self._timer = app.Timer(interval=1.0 / 60.0, connect=self._on_timer, start=True)
 
-        self._stream: Optional[sd.InputStream] = None
-        self._file_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self.audio_path = Path(audio_path).expanduser() if audio_path else None
-
-        native_canvas = getattr(self._canvas, "native", None)
-        if native_canvas is not None and hasattr(native_canvas, "setAcceptDrops"):
-            native_canvas.setAcceptDrops(True)
-        drop_event = getattr(self._canvas.events, "drop", None)
-        if drop_event is not None:
-            drop_event.connect(self._on_drop)  # type: ignore[attr-defined]
-
-        self._reset_visual_state()
-        self._configure_sample_rate(sample_rate)
-        self._set_history_length(history_seconds)
-
-        if self.audio_path:
-            self.load_audio_file(str(self.audio_path))
-        else:
-            self._start_microphone_stream()
+        self._stream = sd.InputStream(
+            samplerate=sample_rate,
+            channels=1,
+            blocksize=hop_size,
+            callback=self._audio_callback,
+        )
+        self._buffer = np.zeros(self.frame_size, dtype=np.float32)
+        self._buffer_offset = 0
 
     # ------------------------------------------------------------------
     # Audio handling
-    def _set_history_length(self, history_seconds: float) -> None:
-        max_points = int(math.ceil(history_seconds * self.sample_rate / self.hop_size))
-        self.history = deque(self.history, maxlen=max_points)
-
-    # ------------------------------------------------------------------
-    def _reset_visual_state(self) -> None:
-        self.history.clear()
-        self._queue = SimpleQueue()
-
-    def _configure_sample_rate(self, sample_rate: int) -> None:
-        self.sample_rate = sample_rate
-        self.extractor = SpectralFeatureExtractor(sample_rate)
-        self._buffer = np.zeros(self.frame_size, dtype=np.float32)
-        self._buffer_offset = 0
-        self._set_history_length(self.history_seconds)
-
-    # ------------------------------------------------------------------
-    def _start_microphone_stream(self) -> None:
-        self._stop_audio_sources()
-        self._reset_visual_state()
-        self._configure_sample_rate(self._default_sample_rate)
-        self.audio_path = None
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=1,
-            blocksize=self.hop_size,
-            callback=self._audio_callback,
-        )
-        self._stream.start()
-
-    def _start_file_thread(self, path: Path) -> None:
-        self._stop_audio_sources()
-        info = sf.info(str(path))
-        self._reset_visual_state()
-        self._configure_sample_rate(info.samplerate)
-        self.audio_path = path
-        channels = info.channels
-
-        def worker() -> None:
-            hop_duration = self.hop_size / self.sample_rate
-            next_time = time.perf_counter()
-            try:
-                with sf.SoundFile(str(path), "r") as audio_file:
-                    while not self._stop_event.is_set():
-                        data = audio_file.read(self.hop_size, dtype="float32", always_2d=True)
-                        if len(data) == 0:
-                            break
-                        samples = data.mean(axis=1) if channels > 1 else data[:, 0]
-                        self._process_samples(samples)
-
-                        next_time += hop_duration
-                        sleep_time = next_time - time.perf_counter()
-                        if sleep_time > 0:
-                            time.sleep(sleep_time)
-            finally:
-                self._stop_event.clear()
-
-        self._stop_event.clear()
-        self._file_thread = threading.Thread(target=worker, daemon=True)
-        self._file_thread.start()
-
-    def _stop_audio_sources(self) -> None:
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-            finally:
-                self._stream.close()
-            self._stream = None
-        if self._file_thread is not None and self._file_thread.is_alive():
-            self._stop_event.set()
-            self._file_thread.join(timeout=1.0)
-            self._stop_event.clear()
-        self._file_thread = None
-
-    # ------------------------------------------------------------------
-    def _process_samples(self, samples: np.ndarray) -> None:
+    def _audio_callback(self, indata: np.ndarray, frames: int, time, status) -> None:  # type: ignore[override]
+        if status:
+            print(status)
+        samples = indata[:, 0].astype(np.float32)
         idx = 0
         while idx < len(samples):
             remaining = self.frame_size - self._buffer_offset
@@ -184,31 +97,6 @@ class AudioReactiveVisualizer:
                     self._buffer_offset = self.frame_size - self.hop_size
                 else:
                     self._buffer_offset = 0
-
-    def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:  # type: ignore[override]
-        if status:
-            print(status)
-        samples = indata[:, 0].astype(np.float32)
-        self._process_samples(samples)
-
-    # ------------------------------------------------------------------
-    def load_audio_file(self, path: str) -> None:
-        file_path = Path(path).expanduser()
-        if not file_path.exists():
-            raise FileNotFoundError(f"Audio file not found: {file_path}")
-        self.audio_path = file_path
-        self._start_file_thread(file_path)
-
-    # ------------------------------------------------------------------
-    def _on_drop(self, event) -> None:  # pragma: no cover - GUI callback
-        paths = getattr(event, "paths", None)
-        if not paths:
-            return
-        try:
-            self.load_audio_file(paths[0])
-            print(f"Loaded audio file: {paths[0]}")
-        except Exception as exc:  # pragma: no cover - runtime feedback
-            print(f"Failed to load audio file: {exc}")
 
     # ------------------------------------------------------------------
     def _on_timer(self, event) -> None:
@@ -300,7 +188,5 @@ class AudioReactiveVisualizer:
     def run(self) -> None:
         """Start the audio stream and run the visualizer event loop."""
 
-        try:
+        with self._stream:
             app.run()
-        finally:
-            self._stop_audio_sources()
